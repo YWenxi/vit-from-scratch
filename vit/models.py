@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import collections
-from typing import Optional
+from typing import Optional, Union, Tuple
 
 from .config import ViTConfig
 
@@ -52,9 +52,8 @@ class ViTPatchEmbedding(nn.Module):
         return embeddings
         
         
-
 class ViTEmbedding(nn.Module):
-    """ TODO: This is the embedding layer. 
+    """ This is the embedding layer. 
     It takes the patch embedding and construct the CLS token, position and patch embeddings. 
     Optionally, also the mask token. """
     def __init__(self, config: ViTConfig, use_mask_token: bool = False):
@@ -147,12 +146,74 @@ class ViTEmbedding(nn.Module):
         
         return embeddings
         
-        
-    
 
 class ViTSelfAttention(nn.Module):
     """ TODO: This is the self-attention layer. 
     It takes the output of the embedding layer and passes it through a series of linear layers and activations. """
+    def __init__(self, config: ViTConfig):
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"hidden_size {config.hidden_size} must be divisible by the "
+                f"number of attention heads {config.num_attention_heads}"
+            )
+        
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        
+        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """ Transpose the input tensor to get the scores for the attention heads. 
+        Args:
+            x (torch.Tensor): The input tensor. Shape: (batch_size, seq_length, hidden_size).
+            
+        Returns:
+            torch.Tensor: The transposed tensor. Shape: (batch_size, num_attention_heads, seq_length, attention_head_size).
+        """
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(*new_x_shape) # (batch_size, seq_length, num_attention_heads, attention_head_size)
+        return x.permute(0, 2, 1, 3)
+    
+    def forward(self, hidden_states: torch.Tensor, 
+                head_mask: Optional[torch.Tensor] = None, 
+                output_attentions: bool = False
+                ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        mixed_query_layer = self.query(hidden_states) # (batch_size, seq_length, self.all_head_size)
+        key_layer = self.transpose_for_scores(self.key(hidden_states)) # (batch_size, num_attention_heads, seq_length, attention_head_size)
+        value_layer = self.transpose_for_scores(self.value(hidden_states)) # (batch_size, num_attention_heads, seq_length, attention_head_size)
+        query_layer = self.transpose_for_scores(mixed_query_layer) # (batch_size, num_attention_heads, seq_length, attention_head_size)
+        
+        # take the dot product to get the attention scores
+        # this is batched matrix multiplication, (batch_size, num_attention_heads, seq_length, seq_length)
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        
+        attention_probs = F.softmax(attention_scores, dim=-1)
+        
+        # mask out the entire tokens to attend to
+        attention_probs = self.dropout(attention_probs)
+        
+        # mask heads if we want to
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
+        
+        context_layer = torch.matmul(attention_probs, value_layer) # (batch_size, num_attention_heads, seq_length, attention_head_size)
+        
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(new_context_layer_shape)
+        
+        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+        
+        return outputs
+        
     
 
 class ViTSdpaSelfAttention(nn.Module):
