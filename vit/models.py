@@ -5,6 +5,8 @@ import math
 import collections
 from typing import Optional
 
+from .config import ViTConfig
+
 
 class ViTPatchEmbedding(nn.Module):
     """ This is the patch embedding layer. 
